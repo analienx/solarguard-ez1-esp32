@@ -1,0 +1,13 @@
+.venv/
+.watchdog/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/firmware/
+firmware/managed_components/
+home_assistant/secrets.generated.txt
+captures/*
+!captures/.gitkeep
+sdkconfig
+sdkconfig.old

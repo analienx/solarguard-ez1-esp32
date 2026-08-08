@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ez1-watchdog"
+version = "0.1.0"
+description = "Host commissioning tools for the APsystems EZ1-M independent watchdog"
+license = "MIT"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

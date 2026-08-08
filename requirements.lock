@@ -1,0 +1,8 @@
+# Direct dependencies pinned for the Windows commissioning environment.
+bleak==3.0.2
+cryptography==50.0.0
+esptool==5.3.1
+pyserial==3.5
+PyYAML==6.0.3
+hypothesis==6.160.0
+pytest==8.4.1

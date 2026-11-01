@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from .errors import EZ1SchemaInvalid
+
+
+_SECRET_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def validate_secret(secret: str) -> str:
+    """Accept exactly what the firmware accepts: 64 ASCII hex characters."""
+    if not isinstance(secret, str) or not _SECRET_PATTERN.fullmatch(secret):
+        raise ValueError("watchdog secret must be exactly 64 hexadecimal characters")
+    return secret
 
 
 def _required(data: dict[str, Any], name: str) -> Any:
@@ -70,15 +81,18 @@ class ProvisionConfig:
     trip_s: int = 180
 
     def validate(self) -> None:
+        # Mirrors firmware config_store_validate() and the NVS field sizes.
         if not self.wifi_ssid or len(self.wifi_ssid.encode()) > 32:
             raise ValueError("Wi-Fi SSID must contain 1-32 bytes")
-        if len(self.wifi_password) > 64:
-            raise ValueError("Wi-Fi password is too long")
+        if len(self.wifi_password.encode()) > 64:
+            raise ValueError("Wi-Fi password must be at most 64 bytes")
         if not self.ez1_host or not self.ez1_device_id:
             raise ValueError("EZ1 host and device ID are required")
-        if len(self.auth_secret) != 64:
-            raise ValueError("auth_secret must be 32 bytes encoded as 64 hex characters")
-        int(self.auth_secret, 16)
+        if len(self.ez1_host.encode()) > 128 or any(char in self.ez1_host for char in "/?#@"):
+            raise ValueError("EZ1 host must be an IP address or hostname of at most 128 bytes")
+        if len(self.ez1_device_id.encode()) > 64:
+            raise ValueError("EZ1 device ID must be at most 64 bytes")
+        validate_secret(self.auth_secret)
         if not (1 <= self.lease_interval_s < self.warning_s < self.trip_s <= 3600):
             raise ValueError("require lease_interval < warning < trip <= 3600 seconds")
 

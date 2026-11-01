@@ -18,3 +18,7 @@ CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+# A hung safety controller must reset the board; a persisted latch is re-enforced at boot
+# and repeated abnormal resets without a lease latch the fail-safe.
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y

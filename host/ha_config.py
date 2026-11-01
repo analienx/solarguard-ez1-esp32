@@ -4,6 +4,8 @@ import secrets
 import re
 from pathlib import Path
 
+from .models import validate_secret
+
 
 PACKAGE_TEMPLATE = '''# Generated EZ1 watchdog package. Do not commit the matching secret.
 rest_command:
@@ -58,6 +60,10 @@ template:
           {{{{ is_state('sensor.ez1_watchdog_state', 'ARMED') }}}}
         availability: >-
           {{{{ states('sensor.ez1_watchdog_state') not in ['unknown', 'unavailable'] }}}}
+      - name: EZ1 Watchdog BLE Ready
+        unique_id: ez1_watchdog_ble_ready
+        state: >-
+          {{{{ (state_attr('sensor.ez1_watchdog_state', 'ez1') or {{}}).get('ble_ready', false) }}}}
       - name: EZ1 Watchdog BLE Identity Verified
         unique_id: ez1_watchdog_ble_identity_verified
         state: >-
@@ -106,6 +112,46 @@ automation:
         seconds: "/{lease_interval_s}"
     actions:
 {lease_guard_condition}      - action: rest_command.ez1_watchdog_lease
+        response_variable: lease_response
+        continue_on_error: true
+      - if:
+          - condition: template
+            value_template: >-
+              {{{{ lease_response is not defined or lease_response.status != 200 }}}}
+        then:
+          - action: persistent_notification.create
+            data:
+              notification_id: ez1_watchdog_lease_failed
+              title: EZ1 watchdog lease failed
+              message: >-
+                The watchdog did not accept the safety lease
+                (HTTP {{{{ lease_response.status if lease_response is defined else 'no response' }}}}).
+                If this persists, the watchdog will trip or is not running.
+        else:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: ez1_watchdog_lease_failed
+
+  - id: ez1_watchdog_offline_notification
+    alias: EZ1 Watchdog - Offline Notification
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: sensor.ez1_watchdog_state
+        to:
+          - unavailable
+          - unknown
+          - UNPROVISIONED
+        for: "00:03:00"
+    actions:
+      - action: persistent_notification.create
+        data:
+          notification_id: ez1_watchdog_offline
+          title: EZ1 watchdog offline
+          message: >-
+            The watchdog status has been {{{{ states('sensor.ez1_watchdog_state') }}}} for
+            three minutes. Fail-safe protection may be inactive (powered off, crashed,
+            unprovisioned after NVS recovery, or unreachable). Check the XIAO over USB.
 
   - id: ez1_watchdog_critical_state_notification
     alias: EZ1 Watchdog - Critical State Notification
@@ -142,10 +188,7 @@ def generate(
         raise ValueError("time-pattern lease interval must be between 1 and 59 seconds")
     if lease_guard and not re.fullmatch(r"binary_sensor\.[a-z0-9_]+", lease_guard):
         raise ValueError("lease guard must be a binary_sensor entity ID")
-    token = secret or secrets.token_hex(32)
-    if len(token) != 64:
-        raise ValueError("secret must be 64 hexadecimal characters")
-    int(token, 16)
+    token = validate_secret(secret or secrets.token_hex(32))
     output_dir.mkdir(parents=True, exist_ok=True)
     package = output_dir / "solar_watchdog.generated.yaml"
     secret_file = output_dir / "secrets.generated.txt"

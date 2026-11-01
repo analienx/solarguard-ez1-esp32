@@ -13,7 +13,7 @@ class State(str, Enum):
     FAILSAFE_APPLYING_BLE = "FAILSAFE_APPLYING_BLE"
     FAILSAFE_LATCHED = "FAILSAFE_LATCHED"
     ACTUATOR_UNREACHABLE = "ACTUATOR_UNREACHABLE"
-    RECOVERY_WAIT = "RECOVERY_WAIT"
+    RECOVERY_WAIT = "RECOVERY_WAIT"  # reserved for API compatibility; never entered
 
 
 class Action(str, Enum):
@@ -65,7 +65,8 @@ class SafetyMachine:
     def lease(self, now_ms: int, authenticated: bool = True) -> Decision:
         if not authenticated or not self.configured:
             return Decision(self.state, reason="lease_rejected")
-        self.last_lease_ms = now_ms
+        if self.last_lease_ms is None or now_ms > self.last_lease_ms:
+            self.last_lease_ms = now_ms
         self.recent_leases = min(self.recent_leases + 1, 2)
         if self.latched:
             return Decision(self.state, reason="lease_accepted_latch_retained")
@@ -81,16 +82,21 @@ class SafetyMachine:
             return Decision(self.state)
         age = self.lease_age(now_ms)
         if age >= self.trip_ms:
-            self.latched = True
-            self.latch_id += 1
-            self.recent_leases = 0
-            self.state = State.FAILSAFE_APPLYING_HTTP
-            return Decision(self.state, Action.PERSIST_LATCH, "lease_expired")
+            return self.trip("lease_expired")
         if age >= self.warning_ms:
             self.state = State.LEASE_WARNING
         elif self.last_lease_ms is not None:
             self.state = State.ARMED
         return Decision(self.state)
+
+    def trip(self, reason: str) -> Decision:
+        if not self.configured or self.latched:
+            return Decision(self.state)
+        self.latched = True
+        self.latch_id += 1
+        self.recent_leases = 0
+        self.state = State.FAILSAFE_APPLYING_HTTP
+        return Decision(self.state, Action.PERSIST_LATCH, reason)
 
     def latch_persisted(self) -> Decision:
         if self.state != State.FAILSAFE_APPLYING_HTTP:
@@ -120,7 +126,6 @@ class SafetyMachine:
             return Decision(self.state, reason="stale_latch_id")
         if not fresh or self.recent_leases < 2:
             return Decision(self.state, reason="fresh_lease_required")
-        self.state = State.RECOVERY_WAIT
         self.latched = False
         self.state = State.ARMED
         return Decision(self.state, Action.CLEAR_LATCH)

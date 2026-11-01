@@ -29,7 +29,8 @@ def test_board_ble_commissioning_is_confirmed_and_observable():
     server = (ROOT / "firmware/main/lease_server.c").read_text(encoding="utf-8")
     assert 'strcmp(confirm->valuestring, "BLESTOP")' in app
     assert '"last_ble_result"' in server
-    assert '"ble_seen_recently", status.ble_identity_verified' in server
+    assert '"ble_seen_recently", ble_recent' in server
+    assert '"ble_ready", status.ble_ready' in server
 
 
 def test_android_capture_never_requests_non_failsafe_power_writes():
@@ -68,3 +69,53 @@ def test_network_stack_starts_before_latched_enforcement_task():
     assert source.index("wifi_manager_start(&config)") < source.index(
         'xTaskCreate(safety_controller, "safety_controller"'
     )
+
+
+def _function_body(source: str, signature: str) -> str:
+    start = source.index(signature)
+    return source[start:source.index("\n}\n", start)]
+
+
+def test_hung_controller_resets_the_board():
+    defaults = (ROOT / "firmware/sdkconfig.defaults").read_text(encoding="utf-8")
+    assert "CONFIG_ESP_TASK_WDT_PANIC=y" in defaults
+    app = (ROOT / "firmware/main/app_main.c").read_text(encoding="utf-8")
+    assert "ABNORMAL_RESET_LATCH_THRESHOLD" in app
+    assert 'safety_trip(&published_status, "repeated_abnormal_reset")' in app
+
+
+def test_ble_result_is_initialized_before_any_early_return():
+    source = (ROOT / "firmware/main/ez1_ble.c").read_text(encoding="utf-8")
+    body = _function_body(source, "static esp_err_t run_operation(")
+    assert body.index("memset(result, 0, sizeof(*result));") < body.index("return ESP_ERR_INVALID_STATE")
+    assert "active_result" not in source
+
+
+def test_ble_callbacks_are_bound_to_one_operation():
+    source = (ROOT / "firmware/main/ez1_ble.c").read_text(encoding="utf-8")
+    assert "is_current(argument)" in source
+    assert "ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &timeout_event)" in source
+    assert "ble_gap_conn_cancel()" in source
+
+
+def test_wifi_test_is_refused_on_a_provisioned_watchdog():
+    app = (ROOT / "firmware/main/app_main.c").read_text(encoding="utf-8")
+    wifi_test = app.split('strcmp(command->valuestring, "wifi_test")', 1)[1]
+    assert wifi_test.index('"already_provisioned"') < wifi_test.index("wifi_manager_start")
+    wifi = (ROOT / "firmware/main/wifi_manager.c").read_text(encoding="utf-8")
+    assert "if (started) return ESP_ERR_INVALID_STATE;" in wifi
+    assert "ESP_ERROR_CHECK" not in wifi
+
+
+def test_ble_fallback_does_not_depend_on_latch_persistence():
+    app = (ROOT / "firmware/main/app_main.c").read_text(encoding="utf-8")
+    body = _function_body(app, "static void enforce_latched(")
+    fallback = body[body.index("} else if (now >= controller.next_ble_attempt_ms)"):]
+    assert "latch_persisted" not in fallback.split("apply_ble_result(status);", 1)[0]
+
+
+def test_leases_are_timestamped_on_receipt():
+    server = (ROOT / "firmware/main/lease_server.c").read_text(encoding="utf-8")
+    assert ".type = WD_EVENT_LEASE, .at_ms = esp_timer_get_time() / 1000" in server
+    app = (ROOT / "firmware/main/app_main.c").read_text(encoding="utf-8")
+    assert "safety_on_lease(status, event->at_ms" in app

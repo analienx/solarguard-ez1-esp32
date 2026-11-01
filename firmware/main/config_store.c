@@ -54,11 +54,16 @@ bool config_store_validate(const watchdog_config_t *config) {
     return true;
 }
 
-esp_err_t config_store_init(void) {
+esp_err_t config_store_init(bool *erased) {
+    *erased = false;
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+        /* Recovery erases configuration and any persisted latch. The board then
+         * boots UNPROVISIONED (no lease server), which the Home Assistant package
+         * reports as an unavailable watchdog, and self_test reports nvs_erased. */
+        *erased = true;
+        err = nvs_flash_erase();
+        if (err == ESP_OK) err = nvs_flash_init();
     }
     return err;
 }
@@ -153,6 +158,26 @@ esp_err_t config_store_set_override_count(uint32_t count) {
     nvs_handle_t handle = 0;
     esp_err_t err = nvs_open(NAMESPACE, NVS_READWRITE, &handle);
     if (err == ESP_OK) err = nvs_set_u32(handle, "overrides", count);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    if (handle) nvs_close(handle);
+    return err;
+}
+
+esp_err_t config_store_get_abnormal_resets(uint8_t *count) {
+    nvs_handle_t handle = 0;
+    *count = 0;
+    esp_err_t err = nvs_open(NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    err = nvs_get_u8(handle, "abn_resets", count);
+    nvs_close(handle);
+    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : err;
+}
+
+esp_err_t config_store_set_abnormal_resets(uint8_t count) {
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) err = nvs_set_u8(handle, "abn_resets", count);
     if (err == ESP_OK) err = nvs_commit(handle);
     if (handle) nvs_close(handle);
     return err;

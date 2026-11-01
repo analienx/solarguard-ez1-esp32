@@ -9,6 +9,8 @@
 #include "safety_state.h"
 #include "wifi_manager.h"
 
+#define BLE_RECENT_MS (15 * 60 * 1000)
+
 #ifndef WATCHDOG_VERSION
 #define WATCHDOG_VERSION "development"
 #endif
@@ -93,7 +95,17 @@ static esp_err_t status_handler(httpd_req_t *request) {
     cJSON *ez1 = cJSON_AddObjectToObject(root, "ez1");
     cJSON_AddBoolToObject(ez1, "identity_verified", status.ez1_identity_verified);
     cJSON_AddBoolToObject(ez1, "http_reachable", status.ez1_http_reachable);
-    cJSON_AddBoolToObject(ez1, "ble_seen_recently", status.ble_identity_verified);
+    bool ble_recent = status.ble_identity_verified && status.last_ble_identity_ms > 0 &&
+                      now_ms - status.last_ble_identity_ms <= BLE_RECENT_MS;
+    cJSON_AddBoolToObject(ez1, "ble_seen_recently", ble_recent);
+    if (status.last_ble_identity_ms > 0) {
+        cJSON_AddNumberToObject(ez1, "ble_identity_age_s",
+                                (now_ms - status.last_ble_identity_ms) / 1000);
+    } else {
+        cJSON_AddNullToObject(ez1, "ble_identity_age_s");
+    }
+    cJSON_AddBoolToObject(ez1, "ble_ready", status.ble_ready);
+    cJSON_AddBoolToObject(ez1, "ble_advert_seen", status.ble_advert_seen);
     if (status.last_ble_result[0]) cJSON_AddStringToObject(ez1, "last_ble_result", status.last_ble_result);
     else cJSON_AddNullToObject(ez1, "last_ble_result");
     cJSON_AddNumberToObject(ez1, "last_verified_max_power", status.last_verified_max_power);
@@ -109,7 +121,7 @@ static esp_err_t status_handler(httpd_req_t *request) {
 
 static esp_err_t lease_handler(httpd_req_t *request) {
     if (!authorized(request)) return unauthorized(request);
-    watchdog_event_t event = {.type = WD_EVENT_LEASE};
+    watchdog_event_t event = {.type = WD_EVENT_LEASE, .at_ms = esp_timer_get_time() / 1000};
     if (xQueueSend(context.events, &event, 0) != pdTRUE) {
         httpd_resp_set_status(request, "503 Service Unavailable");
         return httpd_resp_sendstr(request, "{\"error\":\"event_queue_full\"}");
@@ -125,8 +137,13 @@ static esp_err_t release_handler(httpd_req_t *request) {
         return httpd_resp_sendstr(request, "{\"error\":\"invalid_body\"}");
     }
     char body[129] = {0};
-    int received = httpd_req_recv(request, body, request->content_len);
-    if (received != request->content_len) return ESP_FAIL;
+    size_t received = 0;
+    while (received < request->content_len) {
+        int chunk = httpd_req_recv(request, body + received, request->content_len - received);
+        if (chunk == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (chunk <= 0) return ESP_FAIL;
+        received += (size_t)chunk;
+    }
     cJSON *root = cJSON_Parse(body);
     cJSON *id = root ? cJSON_GetObjectItemCaseSensitive(root, "latch_id") : NULL;
     if (!cJSON_IsNumber(id) || id->valuedouble < 0 || id->valuedouble > UINT32_MAX) {
@@ -147,7 +164,8 @@ static esp_err_t release_handler(httpd_req_t *request) {
         httpd_resp_set_status(request, "409 Conflict");
         return httpd_resp_sendstr(request, "{\"accepted\":false,\"error\":\"release_preconditions_failed\"}");
     }
-    watchdog_event_t event = {.type = WD_EVENT_RELEASE, .latch_id = requested_id};
+    watchdog_event_t event = {.type = WD_EVENT_RELEASE, .latch_id = requested_id,
+                              .at_ms = esp_timer_get_time() / 1000};
     if (xQueueSend(context.events, &event, 0) != pdTRUE) {
         httpd_resp_set_status(request, "503 Service Unavailable");
         return httpd_resp_sendstr(request, "{\"error\":\"event_queue_full\"}");
@@ -158,7 +176,7 @@ static esp_err_t release_handler(httpd_req_t *request) {
 
 static esp_err_t probe_handler(httpd_req_t *request) {
     if (!authorized(request)) return unauthorized(request);
-    watchdog_event_t event = {.type = WD_EVENT_EZ1_PROBE};
+    watchdog_event_t event = {.type = WD_EVENT_EZ1_PROBE, .at_ms = esp_timer_get_time() / 1000};
     if (xQueueSend(context.events, &event, 0) != pdTRUE) {
         httpd_resp_set_status(request, "503 Service Unavailable");
         return httpd_resp_sendstr(request, "{\"error\":\"event_queue_full\"}");
@@ -186,7 +204,11 @@ esp_err_t lease_server_start(const watchdog_config_t *config, QueueHandle_t even
         {.uri = "/api/v1/ez1-probe", .method = HTTP_POST, .handler = probe_handler},
     };
     for (size_t i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); ++i) {
-        ESP_ERROR_CHECK(httpd_register_uri_handler(server, &endpoints[i]));
+        err = httpd_register_uri_handler(server, &endpoints[i]);
+        if (err != ESP_OK) {
+            httpd_stop(server);
+            return err;
+        }
     }
     return ESP_OK;
 }

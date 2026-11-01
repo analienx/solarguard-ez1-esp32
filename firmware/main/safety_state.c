@@ -43,7 +43,7 @@ safety_action_t safety_on_lease(watchdog_status_t *status, int64_t now_ms) {
     if (!status->configured) {
         return SAFETY_ACTION_NONE;
     }
-    status->last_lease_ms = now_ms;
+    if (now_ms > status->last_lease_ms) status->last_lease_ms = now_ms;
     if (status->recent_leases < 2) {
         status->recent_leases++;
     }
@@ -53,18 +53,26 @@ safety_action_t safety_on_lease(watchdog_status_t *status, int64_t now_ms) {
     return SAFETY_ACTION_NONE;
 }
 
+safety_action_t safety_trip(watchdog_status_t *status, const char *reason) {
+    if (!status->configured || status->latched) {
+        return SAFETY_ACTION_NONE;
+    }
+    status->latched = true;
+    status->latch_persisted = false;
+    status->recent_leases = 0;
+    status->latch_id++;
+    status->state = WD_STATE_FAILSAFE_APPLYING_HTTP;
+    snprintf(status->latch_reason, sizeof(status->latch_reason), "%s", reason);
+    return SAFETY_ACTION_PERSIST_LATCH;
+}
+
 safety_action_t safety_on_tick(watchdog_status_t *status, int64_t now_ms) {
     if (!status->configured || status->latched) {
         return SAFETY_ACTION_NONE;
     }
     int64_t age = safety_lease_age_ms(status, now_ms);
     if (age >= status->trip_ms) {
-        status->latched = true;
-        status->recent_leases = 0;
-        status->latch_id++;
-        status->state = WD_STATE_FAILSAFE_APPLYING_HTTP;
-        snprintf(status->latch_reason, sizeof(status->latch_reason), "lease_expired");
-        return SAFETY_ACTION_PERSIST_LATCH;
+        return safety_trip(status, "lease_expired");
     }
     if (age >= status->warning_ms) {
         status->state = WD_STATE_LEASE_WARNING;
@@ -109,7 +117,6 @@ safety_action_t safety_on_release(watchdog_status_t *status, int64_t now_ms,
         !fresh || status->recent_leases < 2) {
         return SAFETY_ACTION_NONE;
     }
-    status->state = WD_STATE_RECOVERY_WAIT;
     status->latched = false;
     status->state = WD_STATE_ARMED;
     status->latch_reason[0] = '\0';

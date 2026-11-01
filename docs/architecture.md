@@ -20,7 +20,7 @@ The existing HA/Zigbee breaker path remains independent. It can still act when H
 
 ## State ownership
 
-HTTP and serial handlers enqueue events. `safety_controller` is the sole state owner. It uses the monotonic ESP timer, persists only configuration and rare latch/override transitions, and is supervised by the ESP-IDF task watchdog.
+HTTP and serial handlers enqueue events; leases carry their monotonic receipt time, so a lease that waited in the queue while the controller was blocked is not counted as fresher than it is. `safety_controller` is the sole state owner and drains all queued events before each trip check. It uses the monotonic ESP timer and persists only configuration and rare latch/override/abnormal-reset transitions. It is supervised by the ESP-IDF task watchdog with `CONFIG_ESP_TASK_WDT_PANIC=y`: a hang reboots the board, a persisted latch is re-enforced at boot, and three consecutive abnormal resets without a lease latch the fail-safe.
 
 ## Actuation
 
@@ -33,7 +33,9 @@ The production actuator has no arbitrary-wattage parameter. It performs:
 5. only if above 30 W, `setMaxPower?p=30`
 6. `getMaxPower` readback equal to 30 W
 
-While latched it checks every 20 seconds. A competing writer above 30 W triggers one reassertion and increments a persistent counter. If this HTTP sequence fails, the firmware scans only for `EZ1_<configured device ID>`, reads and compares `deviceInfo`, sends the fixed production-stop UART frame through the captured BLE wrapper, and requires the exact successful DSP acknowledgement. Failure of both transports is `ACTUATOR_UNREACHABLE`, never success.
+While latched it checks HTTP every 20 seconds. A competing writer above 30 W triggers one reassertion and increments a persistent counter; the first HTTP enforcement after a BLE stop is not counted, because the inverter still holds its pre-incident limit. If the HTTP sequence fails, the firmware scans only for `EZ1_<configured device ID>`, reads and compares `deviceInfo`, sends the fixed production-stop UART frame through the captured BLE wrapper, and requires the exact successful DSP acknowledgement. The BLE fallback never depends on whether the latch could be persisted. BLE attempts back off (20 s doubling to 5 min after failures; 10 min re-assertion after a verified stop). Failure of both transports is `ACTUATOR_UNREACHABLE`, never success.
+
+Every BLE operation has a generation number passed to all NimBLE callbacks; callbacks from an abandoned attempt are ignored and a late connection from one is terminated. Timeouts are delivered to the NimBLE host task, which owns the operation state, and the caller copies the result only after completion.
 
 ## BLE boundary
 

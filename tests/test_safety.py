@@ -102,3 +102,32 @@ def test_old_release_cannot_unlock_new_incident():
     machine.lease(407)
     machine.lease(408)
     assert machine.release(409, old).reason == "stale_latch_id"
+
+
+def test_release_goes_directly_to_armed():
+    machine = armed_machine()
+    machine.tick(201)
+    machine.latch_persisted()
+    machine.http_result(True)
+    machine.lease(300)
+    machine.lease(310)
+    decision = machine.release(311, machine.latch_id)
+    assert decision.action == Action.CLEAR_LATCH
+    assert machine.state == State.ARMED and not machine.latched
+
+
+def test_explicit_trip_latches_once():
+    machine = armed_machine()
+    decision = machine.trip("repeated_abnormal_reset")
+    assert decision.action == Action.PERSIST_LATCH
+    assert decision.reason == "repeated_abnormal_reset"
+    assert machine.latch_id == 1
+    assert machine.trip("again").action == Action.NONE
+    assert machine.latch_id == 1
+
+
+def test_out_of_order_lease_never_moves_lease_time_backwards():
+    machine = armed_machine()
+    machine.lease(150)
+    machine.lease(50)
+    assert machine.last_lease_ms == 150

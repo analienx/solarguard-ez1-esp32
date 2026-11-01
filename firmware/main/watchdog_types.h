@@ -16,7 +16,7 @@ typedef enum {
     WD_STATE_FAILSAFE_APPLYING_BLE,
     WD_STATE_FAILSAFE_LATCHED,
     WD_STATE_ACTUATOR_UNREACHABLE,
-    WD_STATE_RECOVERY_WAIT,
+    WD_STATE_RECOVERY_WAIT, /* reserved for API compatibility; never entered */
 } watchdog_state_t;
 
 typedef enum {
@@ -29,6 +29,7 @@ typedef enum {
 typedef struct {
     watchdog_event_type_t type;
     uint32_t latch_id;
+    int64_t at_ms; /* monotonic receipt time, stamped by the HTTP handler */
 } watchdog_event_t;
 
 typedef struct {
@@ -59,6 +60,10 @@ typedef struct {
     bool ez1_identity_verified;
     bool ez1_http_reachable;
     bool ble_identity_verified;
+    int64_t last_ble_identity_ms;
+    bool ble_ready;
+    bool ble_advert_seen;
+    int64_t last_health_check_ms;
     char last_ble_result[64];
     int last_verified_max_power;
     uint32_t override_count;

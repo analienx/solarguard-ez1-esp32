@@ -19,7 +19,7 @@ from .board import flash_factory, serial_boards, verify_esp32s3
 from .errors import WatchdogError
 from .ez1_http import EZ1Client
 from .ha_config import generate as generate_ha
-from .models import ProvisionConfig
+from .models import ProvisionConfig, validate_secret
 from .provision import ble_stop_test, provision, self_test, wifi_test
 from .report import write_report
 from .commissioning import lease_latch_test, read_only_probe, soak
@@ -51,10 +51,7 @@ def secret_from_file(path: Path) -> str:
     if marker not in content:
         raise ValueError("secret file does not contain a Bearer token")
     secret = content.split(marker, 1)[1].strip().strip('"')
-    if len(secret) != 64:
-        raise ValueError("watchdog secret must be 64 hexadecimal characters")
-    int(secret, 16)
-    return secret
+    return validate_secret(secret)
 
 
 def watchdog_client(args: argparse.Namespace) -> WatchdogClient:
@@ -64,10 +61,7 @@ def watchdog_client(args: argparse.Namespace) -> WatchdogClient:
         secret = secret_from_file(secret_file)
     if not secret:
         secret = getpass.getpass("Watchdog bearer secret: ")
-    if len(secret) != 64:
-        raise ValueError("watchdog secret must be 64 hexadecimal characters")
-    int(secret, 16)
-    return WatchdogClient(args.url, secret)
+    return WatchdogClient(args.url, validate_secret(secret))
 
 
 def add_watchdog_connection(command: argparse.ArgumentParser) -> None:

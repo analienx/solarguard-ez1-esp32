@@ -1,5 +1,6 @@
 #include "ez1_ble.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
+#include "nimble/nimble_npl.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "os/os_mbuf.h"
@@ -24,6 +26,8 @@
 #define BLE_DONE BIT1
 #define BLE_FAILED BIT2
 #define BLE_TIMEOUT_MS 30000
+#define BLE_SCAN_ONLY_TIMEOUT_MS 12000
+#define BLE_FINISH_GRACE_MS 5000
 #define RESPONSE_CAPACITY 1024
 #define REQUEST_CAPACITY 1025
 
@@ -39,12 +43,24 @@ typedef enum {
     STAGE_COMMAND,
 } operation_stage_t;
 
+/*
+ * Concurrency model: every operation gets a new generation number that is
+ * passed as the callback argument to all GAP/GATT procedures. Callbacks for any
+ * other generation are ignored (a late connection from an abandoned attempt is
+ * terminated). All per-operation state below is mutated only by the NimBLE host
+ * task once an operation has started; the caller's timeout is delivered to the
+ * host task as an event, and the caller copies the result out only after the
+ * host task has signalled completion.
+ */
 static EventGroupHandle_t events;
 static SemaphoreHandle_t operation_mutex;
-static bool initialized;
+static bool port_started;
+static volatile uint32_t generation;
+static struct ble_npl_event timeout_event;
 static bool running;
+static bool scan_only;
 static uint8_t own_addr_type;
-static uint16_t connection_handle;
+static uint16_t connection_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t service_start_handle;
 static uint16_t service_end_handle;
 static uint16_t write_handle;
@@ -61,7 +77,7 @@ static uint8_t response_payload[RESPONSE_CAPACITY + 1];
 static size_t response_length;
 static int response_remaining;
 static int response_next_sequence;
-static ez1_ble_result_t *active_result;
+static ez1_ble_result_t op_result;
 static bool target_found;
 
 static int gap_event(struct ble_gap_event *event, void *argument);
@@ -70,30 +86,40 @@ static int service_discovered(uint16_t conn_handle, const struct ble_gatt_error 
 static void finish(bool success, const char *detail);
 static void send_next_fragment(void);
 
+static void *op_arg(void) {
+    return (void *)(uintptr_t)generation;
+}
+
+static bool is_current(void *argument) {
+    return (uint32_t)(uintptr_t)argument == generation && running;
+}
+
 static int mtu_exchanged(uint16_t conn_handle, const struct ble_gatt_error *error,
                          uint16_t mtu, void *argument) {
-    (void)argument;
+    if (!is_current(argument)) return 0;
     if (error->status != 0 || mtu < 71) {
         finish(false, "mtu_exchange_failed");
     } else if (ble_gattc_disc_svc_by_uuid(conn_handle, BLE_UUID16_DECLARE(0xfffe),
-                                          service_discovered, NULL) != 0) {
+                                          service_discovered, argument) != 0) {
         finish(false, "service_discovery_start_failed");
     }
     return 0;
 }
 
-static void set_detail(const char *detail) {
-    if (active_result) snprintf(active_result->detail, sizeof(active_result->detail), "%s", detail);
-}
-
 static void finish(bool success, const char *detail) {
     if (!running) return;
     running = false;
-    set_detail(detail);
-    xEventGroupSetBits(events, success ? BLE_DONE : BLE_FAILED);
+    snprintf(op_result.detail, sizeof(op_result.detail), "%s", detail);
+    if (ble_gap_disc_active()) ble_gap_disc_cancel();
+    if (ble_gap_conn_active()) ble_gap_conn_cancel();
     if (connection_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
+    xEventGroupSetBits(events, success ? BLE_DONE : BLE_FAILED);
+}
+
+static void timeout_fired(struct ble_npl_event *event) {
+    if (is_current(ble_npl_event_get_arg(event))) finish(false, "timeout");
 }
 
 static bool json_string_equals(cJSON *object, const char *name, const char *expected) {
@@ -231,7 +257,7 @@ static int write_complete(uint16_t conn_handle, const struct ble_gatt_error *err
                           struct ble_gatt_attr *attr, void *argument) {
     (void)conn_handle;
     (void)attr;
-    (void)argument;
+    if (!is_current(argument)) return 0;
     if (error->status != 0) {
         finish(false, "gatt_write_failed");
     } else {
@@ -265,7 +291,7 @@ static void send_next_fragment(void) {
         fragment_length = remaining + 4;
     }
     int rc = ble_gattc_write_flat(connection_handle, write_handle, fragment, fragment_length,
-                                  write_complete, NULL);
+                                  write_complete, op_arg());
     if (rc != 0) finish(false, "gatt_write_start_failed");
 }
 
@@ -339,7 +365,7 @@ static void notification_received(struct os_mbuf *mbuf) {
     if (!decrypt_response()) {
         finish(false, stage == STAGE_DEVICE_INFO ? "identity_response_invalid" : "command_response_invalid");
     } else if (stage == STAGE_DEVICE_INFO) {
-        if (active_result) active_result->identity_verified = true;
+        op_result.identity_verified = true;
         start_request(STAGE_COMMAND);
     } else {
         finish(true, "stopped_verified");
@@ -350,7 +376,7 @@ static int subscribe_complete(uint16_t conn_handle, const struct ble_gatt_error 
                               struct ble_gatt_attr *attr, void *argument) {
     (void)conn_handle;
     (void)attr;
-    (void)argument;
+    if (!is_current(argument)) return 0;
     if (error->status != 0) finish(false, "subscribe_failed");
     else start_request(STAGE_DEVICE_INFO);
     return 0;
@@ -360,7 +386,7 @@ static int descriptor_discovered(uint16_t conn_handle, const struct ble_gatt_err
                                  uint16_t chr_val_handle, const struct ble_gatt_dsc *descriptor,
                                  void *argument) {
     (void)chr_val_handle;
-    (void)argument;
+    if (!is_current(argument)) return 0;
     if (error->status == 0 && descriptor &&
         ble_uuid_cmp(&descriptor->uuid.u, BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16)) == 0) {
         cccd_handle = descriptor->handle;
@@ -373,7 +399,7 @@ static int descriptor_discovered(uint16_t conn_handle, const struct ble_gatt_err
         }
         uint8_t enable[] = {1, 0};
         int rc = ble_gattc_write_flat(conn_handle, cccd_handle, enable, sizeof(enable),
-                                      subscribe_complete, NULL);
+                                      subscribe_complete, argument);
         if (rc != 0) finish(false, "subscribe_start_failed");
     } else if (error->status != 0) {
         finish(false, "descriptor_discovery_failed");
@@ -383,7 +409,7 @@ static int descriptor_discovered(uint16_t conn_handle, const struct ble_gatt_err
 
 static int characteristic_discovered(uint16_t conn_handle, const struct ble_gatt_error *error,
                                      const struct ble_gatt_chr *characteristic, void *argument) {
-    (void)argument;
+    if (!is_current(argument)) return 0;
     if (error->status == 0 && characteristic) {
         if (ble_uuid_cmp(&characteristic->uuid.u, BLE_UUID16_DECLARE(0xff0a)) == 0) {
             write_handle = characteristic->val_handle;
@@ -398,7 +424,7 @@ static int characteristic_discovered(uint16_t conn_handle, const struct ble_gatt
             return 0;
         }
         int rc = ble_gattc_disc_all_dscs(conn_handle, notify_handle, service_end_handle,
-                                         descriptor_discovered, NULL);
+                                         descriptor_discovered, argument);
         if (rc != 0) finish(false, "descriptor_discovery_start_failed");
     } else if (error->status != 0) {
         finish(false, "characteristic_discovery_failed");
@@ -408,7 +434,7 @@ static int characteristic_discovered(uint16_t conn_handle, const struct ble_gatt
 
 static int service_discovered(uint16_t conn_handle, const struct ble_gatt_error *error,
                               const struct ble_gatt_svc *service, void *argument) {
-    (void)argument;
+    if (!is_current(argument)) return 0;
     if (error->status == 0 && service) {
         service_start_handle = service->start_handle;
         service_end_handle = service->end_handle;
@@ -420,7 +446,7 @@ static int service_discovered(uint16_t conn_handle, const struct ble_gatt_error 
             return 0;
         }
         int rc = ble_gattc_disc_all_chrs(conn_handle, service_start_handle, service_end_handle,
-                                         characteristic_discovered, NULL);
+                                         characteristic_discovered, argument);
         if (rc != 0) finish(false, "characteristic_discovery_start_failed");
     } else if (error->status != 0) {
         finish(false, "service_discovery_failed");
@@ -429,9 +455,10 @@ static int service_discovered(uint16_t conn_handle, const struct ble_gatt_error 
 }
 
 static int gap_event(struct ble_gap_event *event, void *argument) {
-    (void)argument;
+    bool current = is_current(argument);
     switch (event->type) {
         case BLE_GAP_EVENT_DISC: {
+            if (!current || target_found) return 0;
             struct ble_hs_adv_fields fields;
             if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) != 0 ||
                 !fields.name || fields.name_len != strlen(expected_name) ||
@@ -441,30 +468,42 @@ static int gap_event(struct ble_gap_event *event, void *argument) {
             ble_addr_t address = event->disc.addr;
             target_found = true;
             ble_gap_disc_cancel();
-            int rc = ble_gap_connect(own_addr_type, &address, 10000, NULL, gap_event, NULL);
+            if (scan_only) {
+                finish(true, "advertisement_seen");
+                return 0;
+            }
+            int rc = ble_gap_connect(own_addr_type, &address, 10000, NULL, gap_event, argument);
             if (rc != 0) finish(false, "connect_start_failed");
             return 0;
         }
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status != 0) {
-                finish(false, "connect_failed");
+                if (current) finish(false, "connect_failed");
+                return 0;
+            }
+            if (!current) {
+                /* A connection from an abandoned attempt must not hold the
+                 * EZ1's single BLE connection slot. */
+                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 return 0;
             }
             connection_handle = event->connect.conn_handle;
-            if (ble_gattc_exchange_mtu(connection_handle, mtu_exchanged, NULL) != 0)
+            if (ble_gattc_exchange_mtu(connection_handle, mtu_exchanged, argument) != 0)
                 finish(false, "mtu_exchange_start_failed");
             return 0;
         case BLE_GAP_EVENT_NOTIFY_RX:
-            if (running && event->notify_rx.attr_handle == notify_handle) {
+            if (current && event->notify_rx.attr_handle == notify_handle) {
                 notification_received(event->notify_rx.om);
             }
             return 0;
         case BLE_GAP_EVENT_DISCONNECT:
-            connection_handle = BLE_HS_CONN_HANDLE_NONE;
-            if (running) finish(false, "disconnected");
+            if (event->disconnect.conn.conn_handle == connection_handle) {
+                connection_handle = BLE_HS_CONN_HANDLE_NONE;
+            }
+            if (current) finish(false, "disconnected");
             return 0;
         case BLE_GAP_EVENT_DISC_COMPLETE:
-            if (running && !target_found) finish(false, "device_not_found");
+            if (current && !target_found) finish(false, "device_not_found");
             return 0;
         default:
             return 0;
@@ -483,45 +522,77 @@ static void host_synced(void) {
     }
 }
 
-esp_err_t ez1_ble_init(void) {
-    if (initialized) return ESP_OK;
-    events = xEventGroupCreate();
-    operation_mutex = xSemaphoreCreateMutex();
-    if (!events || !operation_mutex) return ESP_ERR_NO_MEM;
-    if (psa_crypto_init() != PSA_SUCCESS) return ESP_FAIL;
-    esp_err_t err = nimble_port_init();
-    if (err != ESP_OK) return err;
-    if (ble_att_set_preferred_mtu(247) != 0) return ESP_FAIL;
-    ble_hs_cfg.sync_cb = host_synced;
-    nimble_port_freertos_init(host_task);
-    EventBits_t bits = xEventGroupWaitBits(events, BLE_SYNCED, pdFALSE, pdTRUE,
-                                           pdMS_TO_TICKS(5000));
-    if (!(bits & BLE_SYNCED)) return ESP_ERR_TIMEOUT;
-    initialized = true;
-    return ESP_OK;
+static void host_reset(int reason) {
+    ESP_LOGW(TAG, "NimBLE host reset, reason=%d", reason);
+    xEventGroupClearBits(events, BLE_SYNCED);
 }
 
 bool ez1_ble_ready(void) {
-    return initialized;
+    return events && (xEventGroupGetBits(events) & BLE_SYNCED) != 0;
 }
 
-esp_err_t ez1_ble_stop(const watchdog_config_t *config, ez1_ble_result_t *result) {
-    if (!initialized || !config || !result) return ESP_ERR_INVALID_STATE;
+esp_err_t ez1_ble_init(void) {
+    if (ez1_ble_ready()) return ESP_OK;
+    if (!events) events = xEventGroupCreate();
+    if (!operation_mutex) operation_mutex = xSemaphoreCreateMutex();
+    if (!events || !operation_mutex) return ESP_ERR_NO_MEM;
+    if (!port_started) {
+        if (psa_crypto_init() != PSA_SUCCESS) return ESP_FAIL;
+        esp_err_t err = nimble_port_init();
+        if (err != ESP_OK) return err;
+        if (ble_att_set_preferred_mtu(247) != 0) {
+            nimble_port_deinit();
+            return ESP_FAIL;
+        }
+        ble_npl_event_init(&timeout_event, timeout_fired, NULL);
+        ble_hs_cfg.sync_cb = host_synced;
+        ble_hs_cfg.reset_cb = host_reset;
+        nimble_port_freertos_init(host_task);
+        port_started = true;
+    }
+    /* A host that has not synced yet keeps running; ez1_ble_ready() turns true
+     * as soon as it does, and callers may simply call ez1_ble_init() again. */
+    EventBits_t bits = xEventGroupWaitBits(events, BLE_SYNCED, pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(5000));
+    return (bits & BLE_SYNCED) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static void reset_watchdog_if_subscribed(void) {
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+}
+
+static esp_err_t run_operation(const watchdog_config_t *config, ez1_ble_result_t *result,
+                               bool scan_only_mode, int timeout_ms) {
+    if (!result) return ESP_ERR_INVALID_ARG;
     memset(result, 0, sizeof(*result));
+    if (!config) {
+        snprintf(result->detail, sizeof(result->detail), "invalid_argument");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!ez1_ble_ready()) {
+        snprintf(result->detail, sizeof(result->detail), "ble_not_ready");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (xSemaphoreTake(operation_mutex, 0) != pdTRUE) {
         snprintf(result->detail, sizeof(result->detail), "busy");
         return ESP_ERR_TIMEOUT;
     }
+    /* Retire the previous generation first, so no late callback from it can
+     * observe the new operation as current. */
+    uint32_t this_generation = ++generation;
+    if (this_generation == 0) this_generation = ++generation;
+    void *argument = (void *)(uintptr_t)this_generation;
+    xEventGroupClearBits(events, BLE_DONE | BLE_FAILED);
     snprintf(expected_device_id, sizeof(expected_device_id), "%s", config->ez1_device_id);
     snprintf(expected_name, sizeof(expected_name), "EZ1_%s", config->ez1_device_id);
-    active_result = result;
+    memset(&op_result, 0, sizeof(op_result));
     connection_handle = BLE_HS_CONN_HANDLE_NONE;
     service_start_handle = service_end_handle = write_handle = notify_handle = cccd_handle = 0;
     target_found = false;
+    scan_only = scan_only_mode;
     sequence = 0;
     stage = STAGE_IDLE;
     running = true;
-    xEventGroupClearBits(events, BLE_DONE | BLE_FAILED);
     struct ble_gap_disc_params parameters = {
         .itvl = 0,
         .window = 0,
@@ -530,19 +601,50 @@ esp_err_t ez1_ble_stop(const watchdog_config_t *config, ez1_ble_result_t *result
         .passive = 0,
         .filter_duplicates = 1,
     };
-    int rc = ble_gap_disc(own_addr_type, 10000, &parameters, gap_event, NULL);
-    if (rc != 0) finish(false, "scan_start_failed");
+    int rc = ble_gap_disc(own_addr_type, 10000, &parameters, gap_event, argument);
+    if (rc != 0) {
+        running = false;
+        snprintf(op_result.detail, sizeof(op_result.detail), "scan_start_failed");
+        xEventGroupSetBits(events, BLE_FAILED);
+    }
     EventBits_t bits = 0;
-    for (int elapsed = 0; elapsed < BLE_TIMEOUT_MS && !(bits & (BLE_DONE | BLE_FAILED));
+    for (int elapsed = 0; elapsed < timeout_ms && !(bits & (BLE_DONE | BLE_FAILED));
          elapsed += 500) {
         bits = xEventGroupWaitBits(events, BLE_DONE | BLE_FAILED, pdTRUE, pdFALSE,
                                    pdMS_TO_TICKS(500));
-        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+        reset_watchdog_if_subscribed();
     }
-    if (!(bits & (BLE_DONE | BLE_FAILED))) finish(false, "timeout");
+    if (!(bits & (BLE_DONE | BLE_FAILED))) {
+        /* Let the host task cancel the procedure; it owns the operation state. */
+        ble_npl_event_set_arg(&timeout_event, argument);
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &timeout_event);
+        for (int elapsed = 0; elapsed < BLE_FINISH_GRACE_MS && !(bits & (BLE_DONE | BLE_FAILED));
+             elapsed += 500) {
+            bits = xEventGroupWaitBits(events, BLE_DONE | BLE_FAILED, pdTRUE, pdFALSE,
+                                       pdMS_TO_TICKS(500));
+            reset_watchdog_if_subscribed();
+        }
+        if (!(bits & (BLE_DONE | BLE_FAILED))) {
+            /* Host task unresponsive: abandon this generation so any late
+             * callback is ignored and any late connection is terminated. */
+            generation++;
+            snprintf(op_result.detail, sizeof(op_result.detail), "timeout_host_unresponsive");
+        }
+    }
     bool success = (bits & BLE_DONE) != 0;
-    active_result = NULL;
+    *result = op_result;
+    result->detail[sizeof(result->detail) - 1] = '\0';
     xSemaphoreGive(operation_mutex);
-    ESP_LOGI(TAG, "stop result=%s identity=%d", result->detail, result->identity_verified);
+    ESP_LOGI(TAG, "%s result=%s identity=%d", scan_only_mode ? "scan" : "stop", result->detail,
+             result->identity_verified);
     return success ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t ez1_ble_stop(const watchdog_config_t *config, ez1_ble_result_t *result) {
+    return run_operation(config, result, false, BLE_TIMEOUT_MS);
+}
+
+esp_err_t ez1_ble_check_advertisement(const watchdog_config_t *config,
+                                      ez1_ble_result_t *result) {
+    return run_operation(config, result, true, BLE_SCAN_ONLY_TIMEOUT_MS);
 }

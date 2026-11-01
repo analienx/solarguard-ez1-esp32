@@ -45,10 +45,27 @@ The test proves this exact installation and protocol version. No physical safety
 - Firmware BLE contains only the verified production-stop frame.
 - Every first write verifies the configured inverter ID on that transport.
 - BLE success requires the exact captured DSP acknowledgement.
-- The incident latch is persisted in NVS before actuation.
+- The incident latch is persisted in NVS before actuation. If that write fails, actuation still proceeds on both transports, but the state stays `ACTUATOR_UNREACHABLE` (`latch_persist_failed`) and release is refused until the latch is durable.
 - A reboot reloads and re-enforces a persisted latch.
+- A hung safety controller panics the task watchdog and reboots the board. Three consecutive watchdog/panic resets without an intervening lease latch the fail-safe at boot (`repeated_abnormal_reset`), so a crash loop cannot keep restarting the trip timer.
+- While HTTP is unavailable, the BLE stop is retried with backoff (20 s doubling to 5 min after failures) and re-asserted every 10 minutes after a verified stop, instead of reconnecting every 20 seconds.
+- While armed, a read-only health check runs every 10 minutes (HTTP identity/limit read and a BLE advertisement scan, never a connection), only when the lease has enough time left that the check cannot delay a trip.
 - Factory EZ1 firmware is never modified.
-- The XIAO user LED is orange and active-low; solid on means the watchdog firmware is running.
+- The XIAO user LED is orange and active-low; solid on means the watchdog firmware is running and provisioned, blinking means it is unprovisioned and therefore **not protecting anything**.
+
+### Status fields
+
+`/api/v1/status` reports under `ez1`: `ble_ready` (NimBLE host synced; initialization is retried every minute), `ble_seen_recently` (BLE identity verified within the last 15 minutes), `ble_identity_age_s`, `ble_advert_seen` (last health-check scan), `last_ble_result`, `identity_verified`/`http_reachable` (HTTP path only), and `last_verified_max_power` (only updated from a successful HTTP read).
+
+### Conditions that disable protection
+
+An unprovisioned watchdog does nothing. This happens on first boot, after a configuration checksum failure, or when NVS recovery erases flash (reported as `nvs_erased_at_boot` by `board-self-test`). The generated Home Assistant package alerts when the watchdog status is `unavailable`, `unknown`, or `UNPROVISIONED` for three minutes, and whenever a lease is not accepted. Keep those notifications enabled.
+
+### Security model
+
+- The lease, status and release API is plain HTTP with a static bearer secret. Anyone who can observe LAN traffic can learn it, then keep the lease alive (defeating the watchdog) or release a latch. Keep the XIAO, HA and the EZ1 on a trusted network segment.
+- USB serial provisioning and `ble_stop_test` are unauthenticated: physical access to the XIAO is full control.
+- The EZ1 BLE protocol uses a fixed, publicly known key. A nearby device could advertise as `EZ1_<device ID>` and return a forged acknowledgement. Independently confirm production status after any incident.
 
 See [architecture](docs/architecture.md), [failure matrix](docs/failure_matrix.md), and [BLE protocol evidence](docs/ble-protocol-evidence.md) for details.
 
@@ -189,7 +206,7 @@ Follow the full [commissioning checklist](docs/commissioning.md). The decisive t
 2. Confirm state `ARMED`, fresh leases, the exact device ID, and normal inverter operation.
 3. Make the router/AP unavailable for longer than the configured trip timeout plus actuator retries.
 4. Restore the router.
-5. Confirm `failsafe_latched: true`, `latch_persisted: true`, `ble_seen_recently: true`, and `last_ble_result: stopped_verified`.
+5. Confirm `failsafe_latched: true`, `latch_persisted: true`, `ble_seen_recently: true` (identity verified over BLE within the last 15 minutes), and `last_ble_result: stopped_verified`.
 6. Independently confirm inverter status off and output zero.
 7. Confirm fresh leases did not release the latch.
 8. Release using the current latch ID only after normal HA control is healthy.
@@ -204,7 +221,7 @@ Run the host/state/protocol suite:
 python -m pytest -q
 ```
 
-GitHub Actions runs the same suite on every push and pull request. Build-time and source-invariant tests cover fixed command boundaries, identity checks, response framing, confirmation gates, latch behavior, stale-release rejection, reboot persistence, and network initialization ordering. The ESP-IDF build verifies the native NimBLE/PSA implementation. Hardware commissioning adds real USB, HTTP, BLE, lease-expiry, reboot, and router-loss checks.
+GitHub Actions runs the same suite on every push and pull request, plus the native C state-machine tests in `firmware/test/` (built with AddressSanitizer/UBSan) and the ESP-IDF firmware build. Build-time and source-invariant tests cover fixed command boundaries, identity checks, response framing, confirmation gates, latch behavior, stale-release rejection, reboot persistence, and network initialization ordering. The ESP-IDF build verifies the native NimBLE/PSA implementation. Hardware commissioning adds real USB, HTTP, BLE, lease-expiry, reboot, and router-loss checks.
 
 The latest evidence is recorded in [hardware test report](docs/hardware-test-report-2026-08-08.md).
 

@@ -17,7 +17,10 @@ Use the included U.FL antenna, keep it clear of metal, and power the XIAO from a
 11. Test a Wi-Fi interruption shorter than the trip timeout; no clamp should occur.
 12. Run bounded soak tests (24 h, 72 h, then 7 days), preserving the JSONL logs and commissioning report.
 13. Close AP EasyPower and run the confirmed desktop `ble-stop`, verify HTTP reports status off and zero output, then run `ble-limit30` and verify status on with a 30 W limit.
-14. With the XIAO armed and HA leases healthy, perform a supervised router/AP power-off test. After the trip timeout plus bounded actuator retries, restore the router and verify `ez1.ble_seen_recently` is true, `ez1.last_ble_result` is `stopped_verified`, and independent inverter status is off with zero output. Release only with the current latch ID and fresh leases. This test passed on the maintainer installation on 2026-08-08.
+14. With the XIAO armed and HA leases healthy, perform a supervised router/AP power-off test. After the trip timeout plus bounded actuator retries, restore the router and verify `ez1.ble_seen_recently` is true (BLE identity verified within the last 15 minutes), `ez1.last_ble_result` is `stopped_verified`, and independent inverter status is off with zero output. Release only with the current latch ID and fresh leases. This test passed on the maintainer installation on 2026-08-08.
+
+15. `wifi_test` is only accepted on an unprovisioned board; a provisioned watchdog answers `already_provisioned`.
+16. Confirm the HA offline and lease-failure notifications by briefly unplugging the XIAO (offline after 3 minutes; the watchdog will trip if leases stay absent past the trip timeout).
 
 ## Release checklist
 

@@ -14,6 +14,7 @@ void safety_init(watchdog_status_t *status, bool configured, bool persisted_latc
                  uint32_t latch_id, uint32_t boot_id, uint32_t warning_ms,
                  uint32_t trip_ms, int64_t now_ms);
 safety_action_t safety_on_lease(watchdog_status_t *status, int64_t now_ms);
+safety_action_t safety_trip(watchdog_status_t *status, const char *reason);
 safety_action_t safety_on_tick(watchdog_status_t *status, int64_t now_ms);
 safety_action_t safety_latch_persisted(watchdog_status_t *status);
 safety_action_t safety_http_result(watchdog_status_t *status, bool success);

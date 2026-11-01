@@ -155,7 +155,12 @@ esp_err_t ez1_http_probe(const watchdog_config_t *config, ez1_result_t *result) 
     result->max_power = -1;
     esp_err_t err = verify_identity(config, result);
     if (err == ESP_OK) err = read_max(config, &result->max_power);
-    if (err == ESP_OK) snprintf(result->detail, sizeof(result->detail), "read_ok");
+    if (err == ESP_OK) {
+        snprintf(result->detail, sizeof(result->detail), "read_ok");
+    } else if (!result->detail[0]) {
+        snprintf(result->detail, sizeof(result->detail), "%s",
+                 result->reachable ? "max_power_read_failed" : "http_unreachable");
+    }
     return err;
 }
 

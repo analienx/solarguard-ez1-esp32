@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   host:
     runs-on: ubuntu-latest
@@ -14,7 +17,19 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.lock
-      - run: python -m pytest
+      - run: python -m pytest -q
+
+  safety-state:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the firmware safety state machine tests
+        run: |
+          gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -I firmware/main \
+            firmware/test/test_safety_state.c firmware/main/safety_state.c \
+            -o test_safety_state
+          ./test_safety_state
 
   firmware:
     runs-on: ubuntu-latest
